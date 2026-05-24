@@ -3,6 +3,12 @@
 ## Goal
 Maximize token generation speed on CPU-only, low-end hardware by making additive code changes to the llama.cpp inference engine.
 
+## Status: HARDWARE-LIMITED
+**Current best: ~12 t/s | Theoretical max: ~17 t/s | Target: 100 t/s (impossible on this hardware)**
+
+The target of 100 t/s cannot be achieved through code changes alone on this hardware.
+The memory bandwidth ceiling is ~17 t/s for a 762MB model on DDR4-2133 dual-channel.
+
 ## Hardware
 | Spec | Value |
 |------|-------|
@@ -71,50 +77,59 @@ tg scaling from 2→4 threads is only +10%, confirming memory bandwidth saturati
 | 3 | Fully unrolled inner loop | 40.70 | 11.86 | -0.4% | Compiler already unrolling |
 | 4 | Larger chunk_size (64→256) | 41.31 | 11.81 | -0.8% | Reduced parallelism hurt |
 | 5 | Q8 KV cache + flash attention | 36.60 | 11.91 | 0% | KV cache too small at 128 tokens |
-| 6 | ngram-simple speculation | — | 12.4 | +4% | CLI test, helps with repetitive content |
-| 7 | Default ngram-mod speculation | — | crash | — | Requires explicit init, can't be default |
+| 6 | ngram-simple speculation (runtime) | — | 12.4 | +4% | Helps with repetitive content |
+| 7 | Disable mmap (runtime) | 44.74 | 11.65 | -2% | Helps pp (+6%), neutral/neg for tg |
 
 ## Key Findings
 
-### The Q4_K AVX2 kernel is already near-optimal
+### 1. The Q4_K AVX2 kernel is already near-optimal
 - Hot path: `ggml_vec_dot_q4_K_q8_K` in `ggml/src/ggml-cpu/arch/x86/quants.c`
 - Uses efficient `_mm256_maddubs_epi16` + `_mm256_madd_epi16` SIMD patterns
 - Inner loop processes 64 elements per iteration (4 iterations per 256-element block)
 - No obvious inefficiencies remaining
 
-### Memory bandwidth is the hard ceiling
+### 2. Memory bandwidth is the hard ceiling
 - Every kernel optimization attempted was within noise
 - The CPU spends most time waiting for RAM, not computing
 - Hardware prefetcher handles sequential access patterns well
 - No amount of SIMD optimization can overcome this
 
-### llamafile sgemm skips single-token generation
+### 3. llamafile sgemm skips single-token generation
 - Line 3707 in `ggml/src/ggml-cpu/llamafile/sgemm.cpp`: `if (n < 2) return false;`
 - The optimized tinyBLAS path only helps prompt processing (batch > 1)
 
-### Operator fusion is already implemented
+### 4. Operator fusion is already implemented
 - RMS_NORM + MUL fusion exists (`ggml_compute_forward_rms_norm_mul_fused`)
 - SwiGLU is a single fused op
 - No additional fusion opportunities for the Llama architecture
 
-### Speculative decoding is the only path past the bandwidth wall
+### 5. Speculative decoding is the only path past the bandwidth wall
 - N-gram based speculation (`--spec-type ngram-simple`) gives ~4% improvement
 - Full speculative decoding with a draft model can give 2-3x speedup
-- But this changes the effective algorithm, not the raw throughput
+- This changes the effective throughput, not the raw kernel speed
+
+## Best Runtime Settings for This Hardware
+```powershell
+# Use the provided run-optimized.ps1 script, or:
+llama-cli -m model.gguf -t 4 --spec-type ngram-simple -c 2048 -cnv
+```
 
 ## Paths to Higher Throughput
 
-### On THIS hardware (can reach ~14-15 t/s):
-1. Use `--spec-type ngram-mod` for repetitive text workloads
-2. Use smaller context (`-c 512` instead of 2048) to reduce KV cache reads
-3. Use Q4_0 quantization (simpler kernel, ~same bandwidth)
+### On THIS hardware (can reach ~13-15 t/s effective):
+1. Use `--spec-type ngram-simple` for repetitive text workloads (+4%)
+2. Use smaller context (`-c 512`) to reduce KV cache reads for long conversations
+3. Tune `--spec-type ngram-mod` for higher speculation hit rate
 
-### To reach 100 t/s (hardware changes required):
-1. **Use a GPU** — even a budget GPU (RTX 3060) has ~360 GB/s bandwidth = potential ~50+ t/s
-2. **Use a smaller model** — 0.5B parameter model would be ~380MB = ~33 t/s on this CPU
-3. **Use faster RAM** — DDR5-6400 system would roughly double bandwidth
-4. **Use Apple Silicon** — M1/M2 unified memory has ~68 GB/s = potential ~90 t/s with this model
-5. **Speculative decoding** with a tiny draft model — effective 2-3x multiplier on apparent speed
+### To reach 100 t/s (requires different hardware or model):
+| Approach | Expected tg |
+|----------|-------------|
+| Use a GPU (RTX 3060, 360 GB/s) | ~50+ t/s |
+| Use Apple M2 (68 GB/s unified) | ~50-90 t/s |
+| Use a 0.5B model (~380MB) | ~33 t/s on this CPU |
+| Use Q2_K quantization (~300MB) | ~20+ t/s on this CPU |
+| DDR5-6400 system | ~24 t/s |
+| Speculative decoding (2-3x multiplier) | ~24-36 t/s effective |
 
 ## Architecture Notes (for future reference)
 
