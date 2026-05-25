@@ -494,6 +494,14 @@ typedef struct {
 } ggml_metal_kargs_mul_mv_ext;
 
 typedef struct {
+    int32_t  ne00;
+    int32_t  ne01;
+    uint64_t nb01;
+    uint64_t nb01_up;
+    int32_t  ne0;
+} ggml_metal_kargs_mul_mv_glu;
+
+typedef struct {
     int32_t  ne02;
     int32_t  ne10;
     int32_t  ne11;  // n_expert_used (bcast)

@@ -88,6 +88,24 @@ struct ggml_metal_op {
         return ggml_can_fuse_ext(gf, idxs.data() + i0, ops, n_ops);
     }
 
+    bool can_fuse_subgraph(int i0, const ggml_op * ops, int n_ops, const int * outputs, int n_outputs) const {
+        if (!use_fusion) return false;
+        if (i0 + n_ops > n_nodes()) return false;
+
+        int abs_idxs[8];
+        int abs_outputs[4];
+        assert(n_ops <= 8 && n_outputs <= 4);
+
+        for (int i = 0; i < n_ops; i++) {
+            abs_idxs[i] = idxs[i0 + i];
+        }
+        for (int i = 0; i < n_outputs; i++) {
+            abs_outputs[i] = idxs[i0 + outputs[i]];
+        }
+
+        return ggml_can_fuse_subgraph_ext(gf, abs_idxs, n_ops, ops, abs_outputs, n_outputs);
+    }
+
     ggml_metal_device_t  dev;
     ggml_metal_library_t lib;
     ggml_metal_encoder_t enc;
@@ -108,6 +126,7 @@ private:
 
     // non-empty node indices
     std::vector<int> idxs;
+
 };
 
 ggml_metal_op_t ggml_metal_op_init(
@@ -139,6 +158,7 @@ ggml_metal_op_t ggml_metal_op_init(
 void ggml_metal_op_free(ggml_metal_op_t ctx) {
     delete ctx;
 }
+
 
 int ggml_metal_op_n_nodes(ggml_metal_op_t ctx) {
     return ctx->n_nodes();
@@ -2039,6 +2059,78 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
 
     const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx->dev);
 
+    // check for FFN fusion: MUL_MAT + MUL_MAT + GLU → fused kernel
+    if (ctx->use_fusion && op->src[0]->type == GGML_TYPE_Q4_K && op->src[1]->type == GGML_TYPE_F32) {
+        const ggml_op fops[] = { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU };
+        const int outputs[] = { 2 };
+
+        bool subgraph_ok = false;
+        if (idx + 3 <= ctx->n_nodes()) {
+            ggml_tensor * n1 = ctx->node(idx + 1);
+            ggml_tensor * n2 = ctx->node(idx + 2);
+            if (n1->op == GGML_OP_MUL_MAT && n2->op == GGML_OP_GLU) {
+                subgraph_ok = ctx->can_fuse_subgraph(idx, fops, 3, outputs, 1);
+            }
+        }
+
+        if (subgraph_ok) {
+            ggml_tensor * ffn_gate = op;
+            ggml_tensor * ffn_up   = ctx->node(idx + 1);
+            ggml_tensor * glu      = ctx->node(idx + 2);
+
+            const bool valid =
+                ffn_up->src[0]->type == GGML_TYPE_Q4_K &&
+                ffn_up->src[1] == ffn_gate->src[1] &&
+                ((glu->src[0] == ffn_gate && glu->src[1] == ffn_up) ||
+                 (glu->src[0] == ffn_up   && glu->src[1] == ffn_gate)) &&
+                ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU &&
+                !ggml_get_op_params_i32(glu, 1) &&
+                ffn_gate->src[1]->ne[1] == 1 &&
+                ggml_are_same_shape(ffn_gate, ffn_up);
+
+            if (valid) {
+                ggml_tensor * w_gate = (glu->src[0] == ffn_gate) ? ffn_gate->src[0] : ffn_up->src[0];
+                ggml_tensor * w_up   = (glu->src[0] == ffn_gate) ? ffn_up->src[0]   : ffn_gate->src[0];
+
+                ggml_metal_kargs_mul_mv_glu args = {
+                    /*.ne00    =*/ (int32_t) w_gate->ne[0],
+                    /*.ne01    =*/ (int32_t) w_gate->ne[1],
+                    /*.nb01    =*/ w_gate->nb[1],
+                    /*.nb01_up =*/ w_up->nb[1],
+                    /*.ne0     =*/ (int32_t) glu->ne[0],
+                };
+
+                auto pipeline = ggml_metal_library_get_pipeline(lib, "kernel_mul_mv_q4_K_f32_swiglu");
+                if (!pipeline.pipeline) {
+                    pipeline = ggml_metal_library_compile_pipeline(lib, "kernel_mul_mv_q4_K_f32_swiglu", "kernel_mul_mv_q4_K_f32_swiglu", nullptr);
+                }
+                if (!pipeline.pipeline) {
+                    GGML_LOG_ERROR("%s: failed to compile fused FFN kernel\n", __func__);
+                    goto no_fusion;
+                }
+
+                const int nr0 = N_R0_Q4_K;
+                const int nsg = N_SG_Q4_K;
+
+                ggml_metal_encoder_set_pipeline(enc, pipeline);
+                ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+                ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(w_gate),           1);
+                ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(w_up),             2);
+                ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(ffn_gate->src[1]), 3);
+                ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(glu),              4);
+
+                ggml_metal_encoder_dispatch_threadgroups(enc, ((args.ne01 + nr0*nsg - 1)/(nr0*nsg)), 1, 1, 32, nsg, 1);
+
+                if (ctx->debug_fusion > 0) {
+                    GGML_LOG_DEBUG("%s: fused MUL_MAT+MUL_MAT+GLU (Q4_K SwiGLU) at node %d\n", __func__, idx);
+                }
+
+                return 3;
+            }
+        }
+    }
+
+no_fusion:
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
