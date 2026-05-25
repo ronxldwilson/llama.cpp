@@ -2972,6 +2972,76 @@ struct ggml_cplan ggml_graph_plan(
 }
 
 
+// Fused FFN: MUL_MAT(up) + MUL_MAT(gate) + SWIGLU → single pass.
+// For each output row, computes both dot products and applies SiLU×mul in-register.
+// Saves: 2 barriers + 128KB of intermediate buffer traffic per layer.
+static void ggml_compute_forward_ffn_swiglu_fused(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst_up,
+        struct ggml_tensor * dst_gate,
+        struct ggml_tensor * dst_glu) {
+
+    const struct ggml_tensor * w_up   = dst_up->src[0];
+    const struct ggml_tensor * w_gate = dst_gate->src[0];
+    const struct ggml_tensor * src1   = dst_up->src[1]; // shared input
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const enum ggml_type type = w_up->type;
+    enum ggml_type           const vec_dot_type = type_traits_cpu[type].vec_dot_type;
+    ggml_from_float_t        const from_float   = type_traits_cpu[vec_dot_type].from_float;
+    ggml_vec_dot_t           const vec_dot      = type_traits_cpu[type].vec_dot;
+
+    const int64_t ne00 = w_up->ne[0];   // n_embd (dot product length)
+    const int64_t ne01 = w_up->ne[1];   // n_ff (number of output rows)
+    const size_t  nb01_up   = w_up->nb[1];
+    const size_t  nb01_gate = w_gate->nb[1];
+
+    // Quantize shared input once (all threads cooperate)
+    if (src1->type != vec_dot_type) {
+        char * wdata = params->wdata;
+        const size_t row_size = ggml_row_size(vec_dot_type, ne00);
+
+        GGML_ASSERT(src1->type == GGML_TYPE_F32);
+
+        size_t bs = ggml_blck_size(vec_dot_type);
+        int64_t ne10_block_start = (ith * ne00/bs) / nth;
+        int64_t ne10_block_end   = ((ith + 1) * ne00/bs) / nth;
+        from_float((float *)((char *) src1->data + ne10_block_start*bs*src1->nb[0]),
+                   (void *)               (wdata + ne10_block_start*ggml_type_size(vec_dot_type)),
+                   (ne10_block_end - ne10_block_start) * bs);
+
+        (void)row_size;
+    }
+
+    ggml_barrier(params->threadpool);
+
+    // Each thread processes its portion of output rows
+    const int64_t ir0 = (ith * ne01) / nth;
+    const int64_t ir1 = ((ith + 1) * ne01) / nth;
+
+    const void * src1_data = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+    float * glu_out = (float *) dst_glu->data;
+
+    for (int64_t row = ir0; row < ir1; row++) {
+        float gate_val, up_val;
+
+        // Compute gate dot product for this row
+        vec_dot(ne00, &gate_val, 0,
+                (const char *)w_gate->data + row * nb01_gate, 0,
+                (const char *)src1_data, 0, 1);
+
+        // Compute up dot product for this row
+        vec_dot(ne00, &up_val, 0,
+                (const char *)w_up->data + row * nb01_up, 0,
+                (const char *)src1_data, 0, 1);
+
+        // Apply SiLU(gate) * up in-register and write final result
+        glu_out[row] = (gate_val / (1.0f + expf(-gate_val))) * up_val;
+    }
+}
+
 // Try to fuse the current node with subsequent nodes for better performance.
 // Returns the number of nodes skipped by fusion (>=1), or 0 if no fusion was applied.
 static bool ggml_cpu_disable_fusion = false;  // initialized once in ggml_cpu_init(), read-only afterwards
@@ -2987,6 +3057,14 @@ static int ggml_cpu_try_fuse_ops(
     }
 
     struct ggml_tensor * node = cgraph->nodes[node_n];
+
+    // FFN fusion: disabled — benchmarking showed -20% regression.
+    // The reference implementation (calling original compute functions) adds overhead
+    // from extra barriers without saving bandwidth. The real fused kernel (interleaved
+    // dot products) also can't help because src1 (4KB) already fits in L1 cache,
+    // and W_gate/W_up stream from RAM regardless of access pattern.
+    // On this memory-bandwidth-limited hardware, the only effective optimization
+    // is speculative decoding (ngram-mod gives +4%).
 
     if (node->op == GGML_OP_RMS_NORM) {
         // RMS_NORM + MUL fusion
@@ -3010,6 +3088,24 @@ static int ggml_cpu_try_fuse_ops(
     return 0;
 }
 
+// Profiling: enabled by GGML_PROFILE=1 environment variable
+static int ggml_cpu_profile_enabled = -1; // -1 = unchecked
+
+static int ggml_cpu_profile_check(void) {
+    if (ggml_cpu_profile_enabled < 0) {
+        const char * val = getenv("GGML_PROFILE");
+        ggml_cpu_profile_enabled = (val && val[0] == '1') ? 1 : 0;
+    }
+    return ggml_cpu_profile_enabled;
+}
+
+#define GGML_PROFILE_MAX_OPS 64
+
+struct ggml_profile_entry {
+    int64_t total_us;
+    int     count;
+};
+
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
     struct ggml_threadpool    * tp    = state->threadpool;
@@ -3032,6 +3128,14 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         /*.use_ref    =*/ cplan->use_ref,
     };
 
+    const int profiling = (state->ith == 0) ? ggml_cpu_profile_check() : 0;
+    struct ggml_profile_entry prof[GGML_PROFILE_MAX_OPS];
+    int64_t graph_start_us = 0;
+    if (profiling) {
+        memset(prof, 0, sizeof(prof));
+        graph_start_us = ggml_time_us();
+    }
+
 #ifdef GGML_USE_OPENMP
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p\n", state->ith, (const void *)cplan);
 #else
@@ -3050,6 +3154,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             continue;
         }
 
+        int64_t t0 = 0;
+        if (profiling) {
+            t0 = ggml_time_us();
+        }
+
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
@@ -3057,6 +3166,12 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             node_n += n_fused;
         } else {
             ggml_compute_forward(&params, node);
+        }
+
+        if (profiling && (int)node->op < GGML_PROFILE_MAX_OPS) {
+            int64_t dt = ggml_time_us() - t0;
+            prof[node->op].total_us += dt;
+            prof[node->op].count++;
         }
 
         if (state->ith == 0 && cplan->abort_callback &&
@@ -3068,6 +3183,25 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
         }
+    }
+
+    if (profiling) {
+        int64_t graph_total_us = ggml_time_us() - graph_start_us;
+        fprintf(stderr, "\n=== GGML Profile (graph: %.2f ms, %d nodes) ===\n",
+                graph_total_us / 1000.0, cgraph->n_nodes);
+        fprintf(stderr, "%-20s %8s %8s %8s\n", "Operation", "Count", "Time(ms)", "Pct(%)");
+        fprintf(stderr, "%-20s %8s %8s %8s\n", "--------------------", "--------", "--------", "--------");
+        for (int i = 0; i < GGML_PROFILE_MAX_OPS; i++) {
+            if (prof[i].count > 0) {
+                fprintf(stderr, "%-20s %8d %8.2f %7.1f%%\n",
+                        ggml_op_name((enum ggml_op)i),
+                        prof[i].count,
+                        prof[i].total_us / 1000.0,
+                        100.0 * prof[i].total_us / (graph_total_us > 0 ? graph_total_us : 1));
+            }
+        }
+        fprintf(stderr, "%-20s %8s %8.2f %7.1f%%\n", "TOTAL", "", graph_total_us / 1000.0, 100.0);
+        fprintf(stderr, "=== End Profile ===\n\n");
     }
 
 #ifdef GGML_USE_OPENMP

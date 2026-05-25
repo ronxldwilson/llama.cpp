@@ -532,11 +532,69 @@ struct llama_mmap::impl {
     }
 #elif defined(_WIN32)
     HANDLE hMapping = nullptr;
+    bool using_large_pages = false;
+
+    static bool try_enable_large_pages_privilege() {
+        HANDLE hToken;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
+            return false;
+        }
+        TOKEN_PRIVILEGES tp;
+        tp.PrivilegeCount = 1;
+        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        if (!LookupPrivilegeValue(NULL, SE_LOCK_MEMORY_NAME, &tp.Privileges[0].Luid)) {
+            CloseHandle(hToken);
+            return false;
+        }
+        BOOL ok = AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), NULL, NULL);
+        DWORD err = GetLastError();
+        CloseHandle(hToken);
+        return ok && err == ERROR_SUCCESS;
+    }
+
+    bool try_large_pages(struct llama_file * file) {
+        if (!try_enable_large_pages_privilege()) {
+            fprintf(stderr, "large pages: SeLockMemoryPrivilege not available (need admin policy)\n");
+            return false;
+        }
+
+        SIZE_T large_page_size = GetLargePageMinimum();
+        if (large_page_size == 0) {
+            LLAMA_LOG_INFO("%s: large pages: not supported by this system\n", __func__);
+            return false;
+        }
+
+        SIZE_T alloc_size = (size + large_page_size - 1) & ~(large_page_size - 1);
+
+        void * large_addr = VirtualAlloc(NULL, alloc_size,
+            MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE);
+
+        if (!large_addr) {
+            LLAMA_LOG_INFO("%s: large pages: VirtualAlloc failed (need %zu MB, page size %zu MB): %s\n",
+                __func__, alloc_size / (1024*1024), large_page_size / (1024*1024),
+                llama_format_win_err(GetLastError()).c_str());
+            return false;
+        }
+
+        file->seek(0, SEEK_SET);
+        file->read_raw(large_addr, size);
+
+        addr = large_addr;
+        using_large_pages = true;
+        LLAMA_LOG_INFO("%s: large pages: allocated %zu MB with %zu MB pages (TLB entries: %zu)\n",
+            __func__, alloc_size / (1024*1024), large_page_size / (1024*1024),
+            alloc_size / large_page_size);
+        return true;
+    }
 
     impl(struct llama_file * file, size_t prefetch, bool numa) {
         GGML_UNUSED(numa);
 
         size = file->size();
+
+        if (try_large_pages(file)) {
+            return;
+        }
 
         HANDLE hFile = (HANDLE) _get_osfhandle(file->file_id());
 
@@ -583,7 +641,11 @@ struct llama_mmap::impl {
     }
 
     ~impl() {
-        if (hMapping) {
+        if (using_large_pages) {
+            if (addr) {
+                VirtualFree(addr, 0, MEM_RELEASE);
+            }
+        } else if (hMapping) {
             if (addr) {
                 if (!UnmapViewOfFile(addr)) {
                     LLAMA_LOG_WARN("warning: UnmapViewOfFile failed: %s\n",

@@ -32,7 +32,7 @@ $args_list = @(
     "-t", $Threads,
     "-c", $Context,
     "-n", $NPredict,
-    "--spec-type", "ngram-simple",
+    "--spec-type", "ngram-mod",
     "-cnv"
 )
 
@@ -42,7 +42,7 @@ if ($Prompt) {
 
 Write-Host "Running with optimized settings (ngram speculation enabled)..."
 Write-Host "Model: $Model"
-Write-Host "Threads: $Threads | Context: $Context | Spec: ngram-simple"
+Write-Host "Threads: $Threads | Context: $Context | Spec: ngram-mod"
 Write-Host "---"
 
 & "$BinDir\llama-cli.exe" @args_list
