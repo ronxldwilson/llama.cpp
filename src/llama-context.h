@@ -253,6 +253,8 @@ private:
 
     llm_graph_cb graph_get_cb() const;
 
+    void adaskip_update(llm_graph_result * res);
+
     // TODO: read/write lora adapters and cvec
     size_t state_write_data(llama_io_write_i & io);
     size_t state_read_data (llama_io_read_i  & io);
@@ -357,6 +359,14 @@ private:
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
 
     bool has_evaluated_once = false;
+
+    // AdaSkip: per-layer hidden state cache for sublayer skipping
+    struct {
+        bool                has_prev = false;
+        int32_t             prev_n_eval = -1; // n_eval when prev was stored, to detect cache clears
+        std::vector<float>  prev_ffn_inp;     // [n_layer * n_embd]
+        std::vector<bool>   skip_ffn;         // [n_layer]
+    } adaskip;
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;

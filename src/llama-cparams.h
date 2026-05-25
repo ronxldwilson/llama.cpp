@@ -40,6 +40,8 @@ struct llama_cparams {
     bool no_perf;
     bool warmup;
     bool op_offload;
+
+    float adaskip_thold; // 0 = disabled
     bool kv_unified;
     bool pipeline_parallel;
 

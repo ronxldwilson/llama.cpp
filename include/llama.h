@@ -357,6 +357,7 @@ extern "C" {
         float    yarn_beta_slow;   // YaRN high correction dim
         uint32_t yarn_orig_ctx;    // YaRN original context size
         float    defrag_thold;     // [DEPRECATED] defragment the KV cache if holes/size > thold, <= 0 disabled (default)
+        float    adaskip_thold;    // AdaSkip: cosine similarity threshold for FFN sublayer skipping, 0 = disabled [EXPERIMENTAL]
 
         ggml_backend_sched_eval_callback cb_eval;
         void * cb_eval_user_data;

@@ -84,6 +84,7 @@ llama_context::llama_context(
     cparams.cb_eval_user_data = params.cb_eval_user_data;
 
     cparams.ctx_type          = params.ctx_type;
+    cparams.adaskip_thold     = params.adaskip_thold;
 
     // Initialize backend samplers here so they are part of the sampling graph
     // before the reserve passes run later in this function. This avoids a later
@@ -1313,6 +1314,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    // AdaSkip: read hidden states and compute skip masks for next token
+    if (cparams.adaskip_thold > 0.0f && ubatch.n_tokens == 1) {
+        adaskip_update(res);
+    }
+
     ret = GGML_STATUS_SUCCESS;
 
     return res;
@@ -2299,6 +2305,7 @@ llm_graph_params llama_context::graph_params(
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
+        /*.adaskip_skip_ffn =*/ adaskip.skip_ffn,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };
@@ -3327,6 +3334,74 @@ void llama_context::opt_epoch(
 }
 
 //
+// AdaSkip
+//
+
+static float adaskip_cosine_sim(const float * a, const float * b, int64_t n) {
+    float dot = 0.0f, na = 0.0f, nb = 0.0f;
+    for (int64_t i = 0; i < n; ++i) {
+        dot += a[i] * b[i];
+        na  += a[i] * a[i];
+        nb  += b[i] * b[i];
+    }
+    float denom = sqrtf(na) * sqrtf(nb);
+    return denom > 1e-8f ? dot / denom : 1.0f;
+}
+
+void llama_context::adaskip_update(llm_graph_result * res) {
+    const int64_t nl    = model.hparams.n_layer;
+    const int64_t n_embd = model.hparams.n_embd;
+
+    // lazy init
+    if ((int64_t) adaskip.prev_ffn_inp.size() != nl * n_embd) {
+        adaskip.prev_ffn_inp.resize(nl * n_embd, 0.0f);
+        adaskip.skip_ffn.assign(nl, false);
+        adaskip.has_prev = false;
+    }
+
+    // detect context reset (n_eval went backwards or jumped)
+    if (adaskip.prev_n_eval >= n_eval) {
+        adaskip.has_prev = false;
+        std::fill(adaskip.skip_ffn.begin(), adaskip.skip_ffn.end(), false);
+    }
+    adaskip.prev_n_eval = n_eval;
+
+    ggml_backend_sched_synchronize(sched.get());
+
+    ggml_cgraph * gf = res->get_gf();
+    std::vector<float> cur_ffn_inp(nl * n_embd);
+
+    char tname[GGML_MAX_NAME];
+    static int _read_dbg = 0;
+    for (int il = 0; il < (int) nl; ++il) {
+        snprintf(tname, sizeof(tname), "ffn_inp-%d", il);
+        ggml_tensor * t = ggml_graph_get_tensor(gf, tname);
+        if (t && ggml_nelements(t) >= n_embd) {
+            ggml_backend_tensor_get(t, cur_ffn_inp.data() + il * n_embd, 0, n_embd * sizeof(float));
+        }
+    }
+
+    if (adaskip.has_prev) {
+        int n_skip = 0;
+        float min_sim = 1.0f, max_sim = 0.0f;
+        for (int il = 0; il < (int) nl; ++il) {
+            const float * prev = adaskip.prev_ffn_inp.data() + il * n_embd;
+            const float * cur  = cur_ffn_inp.data() + il * n_embd;
+            float sim = adaskip_cosine_sim(prev, cur, n_embd);
+            adaskip.skip_ffn[il] = (sim >= cparams.adaskip_thold);
+            if (adaskip.skip_ffn[il]) {
+                n_skip++;
+            }
+            if (sim < min_sim) min_sim = sim;
+            if (sim > max_sim) max_sim = sim;
+        }
+    }
+
+    std::swap(adaskip.prev_ffn_inp, cur_ffn_inp);
+    adaskip.has_prev = true;
+}
+
+//
 // interface implementation
 //
 
@@ -3352,6 +3427,7 @@ llama_context_params llama_context_default_params() {
         /*.yarn_beta_slow              =*/ -1.0f,
         /*.yarn_orig_ctx               =*/ 0,
         /*.defrag_thold                =*/ -1.0f,
+        /*.adaskip_thold               =*/ 0.0f,
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,

@@ -1226,6 +1226,7 @@ struct cmd_params_instance {
         cparams.embeddings      = embeddings;
         cparams.op_offload      = !no_op_offload;
         cparams.swa_full        = false;
+        cparams.adaskip_thold   = 0.0f; // disabled
 
         return cparams;
     }

@@ -565,6 +565,8 @@ struct llm_graph_params {
 
     uint32_t n_outputs;
 
+    std::vector<bool> adaskip_skip_ffn;
+
     llm_graph_cb cb;
 
     llm_graph_result * res;
@@ -623,6 +625,10 @@ struct llm_graph_params {
                     return false;
                 }
             }
+        }
+
+        if (adaskip_skip_ffn != other.adaskip_skip_ffn) {
+            return false;
         }
 
         return
@@ -764,6 +770,8 @@ struct llm_graph_context {
     const llama_cross            * cross;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+
+    const std::vector<bool> & adaskip_skip_ffn;
 
     const llm_graph_cb & cb_func;
 
