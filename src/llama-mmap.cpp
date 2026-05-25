@@ -465,6 +465,11 @@ struct llama_mmap::impl {
                         strerror(errno));
             }
         }
+#ifdef __APPLE__
+        if (file->size() >= 2 * 1024 * 1024) {
+            posix_madvise(addr, file->size(), POSIX_MADV_SEQUENTIAL);
+        }
+#endif
         if (numa) {
             if (posix_madvise(addr, file->size(), POSIX_MADV_RANDOM)) {
                 LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_RANDOM) failed: %s\n",

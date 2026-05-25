@@ -1409,10 +1409,26 @@ static void * ggml_metal_host_malloc(size_t n) {
     void * data = NULL;
 
 #if TARGET_OS_OSX
-    kern_return_t err = vm_allocate((vm_map_t) mach_task_self(), (void *) &data, n, VM_FLAGS_ANYWHERE);
+    const size_t size_superpage_threshold = 64 * 1024 * 1024;
+    const size_t size_superpage = 2 * 1024 * 1024;
+    kern_return_t err = KERN_FAILURE;
+
+    if (n >= size_superpage_threshold) {
+        size_t n_aligned = (n + size_superpage - 1) & ~(size_superpage - 1);
+        err = vm_allocate((vm_map_t) mach_task_self(), (void *) &data, n_aligned, VM_FLAGS_ANYWHERE | VM_FLAGS_SUPERPAGE_SIZE_2MB);
+        if (err == KERN_SUCCESS) {
+            n = n_aligned;
+        } else {
+            data = NULL;
+        }
+    }
+
     if (err != KERN_SUCCESS) {
-        GGML_LOG_ERROR("%s: error: vm_allocate failed\n", __func__);
-        return NULL;
+        err = vm_allocate((vm_map_t) mach_task_self(), (void *) &data, n, VM_FLAGS_ANYWHERE);
+        if (err != KERN_SUCCESS) {
+            GGML_LOG_ERROR("%s: error: vm_allocate failed\n", __func__);
+            return NULL;
+        }
     }
 #else
     const int result = posix_memalign((void **) &data, sysconf(_SC_PAGESIZE), n);
